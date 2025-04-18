@@ -1,0 +1,595 @@
+import time
+import difflib
+import cv2
+import requests
+import speech_recognition as sr
+from gtts import gTTS, gTTSError
+import os
+import openai
+import base64
+from playsound import playsound
+
+# === CONFIG ===
+openai.api_key = (
+    "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"
+)  # Replace with your key
+
+# ─────────────────────────────────────────────────────────────
+# GLOBALS
+# ─────────────────────────────────────────────────────────────
+current_input_lang = None
+current_tts_lang = None
+
+exit_cmd = capture_cmd = translate_cmd = read_cmd = chat_cmd = moneycounter_cmd = ""
+prompt_capture = prompt_translate = prompt_read = prompt_moneycounter = ""
+chat_system_prompt = ""
+
+feedback_capture_start = feedback_capture_success = ""
+error_capture = error_connection = error_understand = ""
+entering_chat = exiting_chat = exiting_program = unknown_command = ""
+
+# Base‑64 copy of the most recently captured image (for follow‑ups)
+last_image_b64 = None
+
+# Create a persistent Recognizer instance to preserve calibration between listens.
+recognizer = sr.Recognizer()
+# Optionally, pre‐set the dynamic energy threshold and any other parameters
+recognizer.dynamic_energy_threshold = True
+
+# ─────────────────────────────────────────────────────────────
+# AUDIO HELPERS
+# ─────────────────────────────────────────────────────────────
+def speak(text, lang=current_tts_lang, max_retries=3, initial_delay=1.0):
+    if not text:
+        return
+
+    delay = initial_delay
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Generate and play speech
+            tts = gTTS(text, lang=lang)
+            tts.save("response.mp3")
+            playsound("response.mp3")
+            os.remove("response.mp3")
+            return  # Success on first try.
+        except (gTTSError, requests.exceptions.ConnectionError) as e:
+            print(f"Attempt {attempt} failed: {e}")
+            if attempt == max_retries:
+                print("All TTS retries failed. Skipping audio output.")
+                return
+            print(f"Retrying in {delay} seconds...")
+            time.sleep(delay)
+            delay *= 2
+
+# Modified: Increased ambient noise calibration duration and re-use of persistent recognizer.
+def listen_for_command(suppress=False):
+    global recognizer
+    attempts = 0
+    # Localized re‑prompt messages for commands.
+    repeat_command = {
+        "en": "Please repeat your command.",
+        "ar": "يرجى إعادة الأمر.",
+        "fr": "Veuillez répéter votre commande."
+    }
+    while attempts < 3:
+        with sr.Microphone() as source:
+            print("🎙️ Listening for command...")
+            # Increase calibration duration for better ambient noise estimate.
+            recognizer.adjust_for_ambient_noise(source, duration=1)
+            recognizer.pause_threshold = 0.8
+            audio = recognizer.listen(source)
+        try:
+            cmd = recognizer.recognize_google(audio, language=current_input_lang).lower().strip()
+            print(f"🗣️ Heard: {cmd}")
+            return cmd
+        except sr.UnknownValueError:
+            attempts += 1
+            print("😕", error_understand)
+            if not suppress:
+                speak(error_understand, lang=current_tts_lang)
+                if attempts < 3:
+                    speak(repeat_command.get(current_tts_lang, "Please repeat your command."), lang=current_tts_lang)
+        except sr.RequestError:
+            attempts += 1
+            print("🔌", error_connection)
+            if not suppress:
+                speak(error_connection, lang=current_tts_lang)
+                if attempts < 3:
+                    speak(repeat_command.get(current_tts_lang, "Please repeat your command."), lang=current_tts_lang)
+    return ""
+
+def listen_for_chat():
+    global recognizer
+    attempts = 0
+    # Localized re‑prompt messages for chat.
+    repeat_message = {
+        "en": "Please repeat your message.",
+        "ar": "يرجى إعادة رسالتك.",
+        "fr": "Veuillez répéter votre message."
+    }
+    while attempts < 3:
+        with sr.Microphone() as source:
+            print("🎙️ Listening for chat input...")
+            recognizer.adjust_for_ambient_noise(source, duration=1)
+            recognizer.pause_threshold = 0.8
+            audio = recognizer.listen(source, phrase_time_limit=15)
+        try:
+            chat = recognizer.recognize_google(audio, language=current_input_lang).lower().strip()
+            print(f"🗣️ Heard (chat): {chat}")
+            return chat
+        except sr.UnknownValueError:
+            attempts += 1
+            print("😕", error_understand)
+            speak(error_understand, lang=current_tts_lang)
+            if attempts < 3:
+                speak(repeat_message.get(current_tts_lang, "Please repeat your message."), lang=current_tts_lang)
+        except sr.RequestError:
+            attempts += 1
+            print("🔌", error_connection)
+            speak(error_connection, lang=current_tts_lang)
+            if attempts < 3:
+                speak(repeat_message.get(current_tts_lang, "Please repeat your message."), lang=current_tts_lang)
+    return ""
+
+# ─────────────────────────────────────────────────────────────
+# FOLLOW‑UP LOGIC (UPDATED)
+# ─────────────────────────────────────────────────────────────
+def follow_up_query():
+    """
+    Allow multiple follow‑up questions strictly about the last photo.
+    The same image is re‑attached to every request so answers stay on topic.
+    """
+    global last_image_b64
+    if not last_image_b64:
+        return
+
+    while True:
+        followup_prompts = {
+            "ar": "هل لديك سؤال متابعة حول هذه الصورة؟ إذا نعم اطرحه، وإلا قل لا.",
+            "fr": "Avez‑vous une question de suivi concernant cette image ? Si non, dites « non ». ",
+            "en": "Do you have a follow‑up question about this image? If not, say no."
+        }
+        prompt = followup_prompts.get(current_tts_lang, followup_prompts["en"])
+        speak(prompt, lang=current_tts_lang)
+
+        query = listen_for_chat().lower().strip()
+        if query == "" or query == " ":
+            return
+
+        no_tokens = {
+            "ar": {"لا", "كلا"},
+            "fr": {"non", "revenir"},
+            "en": {"no", "nope", "back", "cancel", "Cancel"}
+        }
+        if query in no_tokens.get(current_tts_lang, {"no"}):
+            return
+
+        try:
+            resp = openai.ChatCompletion.create(
+                model="gpt-4-turbo",
+                messages=[
+                    {"role": "system", "content": chat_system_prompt},
+                    {"role": "system", "content": "Base every answer strictly on the attached photo."},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": query},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{last_image_b64}"}}
+                        ],
+                    },
+                ],
+                max_tokens=300,
+            )
+            answer = resp.choices[0].message.content
+        except Exception as e:
+            print("Error with OpenAI API in follow‑up query:", e)
+            followup_error = {
+                "en": "There was an error processing your follow‑up.",
+                "ar": "حدث خطأ أثناء معالجة السؤال المتابع.",
+                "fr": "Une erreur est survenue lors du traitement de votre question de suivi."
+            }
+            speak(followup_error.get(current_tts_lang, "There was an error processing your follow‑up."), lang=current_tts_lang)
+            return
+
+        print("🧠 ChatGPT Follow‑Up Response:", answer)
+        speak(answer, lang=current_tts_lang)
+
+# ─────────────────────────────────────────────────────────────
+# HELP / ABOUT
+# ─────────────────────────────────────────────────────────────
+def show_help():
+    if current_tts_lang == "en":
+        msg = "Available commands: capture, translate, read, moneycounter, chat, sleep, help, about, exit."
+    elif current_tts_lang == "ar":
+        msg = "الأوامر المتاحة: التقط، ترجم، اقرأ، عداد المال، دردشة، نوم، مساعدة، عن الجهاز، خروج."
+    else:
+        msg = "Commandes disponibles : capturer, traduire, lire, compteur, discussion, sommeil, aide, à propos, sortir."
+    speak(msg, lang=current_tts_lang)
+
+def show_about():
+    msg = {
+        "en": "I am Nour the smart glasses, I help people live.",
+        "ar": "أنا نور النظارات الذكية، أساعد الناس على العيش.",
+        "fr": "Je suis Nour, les lunettes intelligentes, j'aide les gens à vivre."
+    }.get(current_tts_lang, "")
+    speak(msg, lang=current_tts_lang)
+
+# ─────────────────────────────────────────────────────────────
+# COMMAND TABLES
+# ─────────────────────────────────────────────────────────────
+def get_known_commands():
+    if current_tts_lang == "en":
+        return {
+            "exit": exit_cmd,
+            "capture": capture_cmd,
+            "translate": translate_cmd,
+            "read": read_cmd,
+            "chat": chat_cmd,
+            "money counter": moneycounter_cmd,
+            "help": "help",
+            "about": "about",
+            "sleep": "sleep",
+        }
+    elif current_tts_lang == "ar":
+        return {
+            "exit": exit_cmd,
+            "capture": capture_cmd,
+            "translate": translate_cmd,
+            "read": read_cmd,
+            "chat": chat_cmd,
+            "money counter": moneycounter_cmd,
+            "help": "مساعدة",
+            "about": "عن الجهاز",
+            "sleep": "نوم",
+        }
+    else:
+        return {
+            "exit": exit_cmd,
+            "capture": capture_cmd,
+            "translate": translate_cmd,
+            "read": read_cmd,
+            "chat": chat_cmd,
+            "money counter": moneycounter_cmd,
+            "help": "aide",
+            "about": "à propos",
+            "sleep": "sommeil",
+        }
+
+# Moved out to module level.
+def autocomplete_command(cmd: str) -> str:
+    """
+    Take a (possibly partial / slightly misspelled) spoken command and
+    return the best full command + any trailing args, or "" if no input,
+    or the cleaned original if nothing else matches.
+    Enhanced: removes punctuation and uses a lower cutoff for fuzzy matching.
+    """
+    # 1) Normalize and remove punctuation
+    import string
+    translator = str.maketrans('', '', string.punctuation)
+    cmd_clean = " ".join(cmd.lower().strip().translate(translator).split())
+    if not cmd_clean:
+        return ""
+
+    # 2) Gather known commands
+    known = list(get_known_commands().values())
+
+    # 3) Exact match
+    if cmd_clean in known:
+        return cmd_clean
+
+    # 4) Prefix match (longest known first, so we match the most specific)
+    for full in sorted(known, key=len, reverse=True):
+        if cmd_clean.startswith(full):
+            rest = cmd_clean[len(full):].strip()
+            return full + (f" {rest}" if rest else "")
+
+    # 5) Fuzzy match for typos with lower cutoff of 0.5
+    close = difflib.get_close_matches(cmd_clean, known, n=1, cutoff=0.5)
+    if close:
+        return close[0]
+
+    # 6) Give back what we got (so downstream can handle it as “unknown”)
+    return cmd_clean
+
+# ─────────────────────────────────────────────────────────────
+# Helper function for precise command matching.
+def command_matches(command, base_cmd):
+    # Returns True if command equals base_cmd or starts with it followed by a space.
+    return command == base_cmd or command.startswith(base_cmd + " ")
+
+# ─────────────────────────────────────────────────────────────
+# LANGUAGE SELECTION (WITH FIXED ERRORS)
+# ─────────────────────────────────────────────────────────────
+def select_language():
+    global current_input_lang, current_tts_lang
+    global exit_cmd, capture_cmd, translate_cmd, read_cmd, chat_cmd, moneycounter_cmd
+    global prompt_capture, prompt_translate, prompt_read, prompt_moneycounter, chat_system_prompt
+    global feedback_capture_start, feedback_capture_success, error_capture, error_connection, error_understand
+    global entering_chat, exiting_chat, exiting_program, unknown_command
+
+    # temporary Arabic prompt
+    current_input_lang, current_tts_lang = "ar-SA", "ar"
+    error_understand = "لم أفهم ما قلت. حاول مرة أخرى."
+    error_connection = "أواجه مشكلة في الاتصال. يرجى التحقق من اتصال الإنترنت."
+    speak("هل تريد لغة إنجليزية أم عربية أم فرنسية؟", lang="ar")
+    ans = listen_for_command()
+
+    # — ENGLISH —
+    if "english" in ans or "انجليزي" in ans:
+        current_input_lang, current_tts_lang = "en-US", "en"
+        error_understand = "Sorry, I didn't catch that. Please try again."
+        error_connection = "Connection issue. Please check your internet."
+        exit_cmd, capture_cmd, translate_cmd, read_cmd = "exit", "capture", "translate", "read"
+        chat_cmd, moneycounter_cmd = "chat", "money counter"
+        prompt_capture = "What do you see in this image?"
+        prompt_translate = "Translate any text in this image into English."
+        prompt_read = "Read the text in this image aloud."
+        prompt_moneycounter = "Count the money in this image."
+        chat_system_prompt = (
+            "You are a friendly and informative conversational assistant. Engage like a friend."
+        )
+        feedback_capture_start, feedback_capture_success = (
+            "Capturing image now.",
+            "Image captured successfully.",
+        )
+        error_capture = "Failed to capture image. Please check your camera."
+        entering_chat, exiting_chat = (
+            "Entering chitchat mode. Say 'exit' to leave.",
+            "Exiting chitchat mode.",
+        )
+        exiting_program, unknown_command = (
+            "Exiting program now. Goodbye!",
+            "Unknown command. Say capture, read, translate, chat, moneycounter, help, about, or exit.",
+        )
+        speak("Language set to English.", lang=current_tts_lang)
+
+    # — ARABIC —
+    elif "عربي" in ans or "arabic" in ans:
+        current_input_lang, current_tts_lang = "ar-SA", "ar"
+        error_understand = "لم أفهم ما قلت. حاول مرة أخرى."
+        error_connection = "أواجه مشكلة في الاتصال. يرجى التحقق من اتصال الإنترنت."
+        exit_cmd, capture_cmd, translate_cmd, read_cmd = "خروج", "التقط", "ترجم", "اقرأ"
+        chat_cmd, moneycounter_cmd = "دردشة", "عداد المال"
+        prompt_capture = "ماذا ترى في هذه الصورة؟"
+        prompt_translate = "ترجم أي نص موجود في هذه الصورة إلى العربية."
+        prompt_read = "اقرأ النص الموجود في هذه الصورة."
+        prompt_moneycounter = "عد النقود في هذه الصورة."
+        chat_system_prompt = "أنت مساعد ودود ومفيد. تحدث مع المستخدم بأسلوب مريح."
+        feedback_capture_start, feedback_capture_success = (
+            "جاري التقاط الصورة الآن.",
+            "تم التقاط الصورة بنجاح.",
+        )
+        error_capture = "فشل التقاط الصورة. يرجى التحقق من الكاميرا."
+        entering_chat, exiting_chat = (
+            "جاري الدخول إلى وضع الدردشة. قل 'خروج' للخروج.",
+            "جاري الخروج من وضع الدردشة.",
+        )
+        exiting_program, unknown_command = (
+            "جارٍ إنهاء البرنامج. مع السلامة!",
+            "أمر غير معروف. قل التقط، اقرأ، ترجم، دردشة، عداد المال، مساعدة، عن الجهاز، أو خروج.",
+        )
+        speak("تم اختيار اللغة العربية.", lang=current_tts_lang)
+
+    # — FRENCH —
+    elif "french" in ans or "français" in ans or "فرنسي" in ans:
+        current_input_lang, current_tts_lang = "fr-FR", "fr"
+        error_understand = "Désolé, je n'ai pas compris. Veuillez réessayer."
+        error_connection = "Problème de connexion. Veuillez vérifier votre Internet."
+        exit_cmd, capture_cmd, translate_cmd, read_cmd = "sortir", "capturer", "traduire", "lire"
+        chat_cmd, moneycounter_cmd = "discussion", "compteur"
+        prompt_capture = "Que voyez‑vous dans cette image ?"
+        prompt_translate = "Traduisez le texte de cette image en français."
+        prompt_read = "Lisez le texte de cette image à haute voix."
+        prompt_moneycounter = "Comptez l'argent dans cette image."
+        chat_system_prompt = "Vous êtes un assistant amical et informatif."
+        feedback_capture_start, feedback_capture_success = (
+            "Capture de l'image en cours.",
+            "Image capturée avec succès.",
+        )
+        error_capture = "Échec de la capture. Vérifiez la caméra."
+        entering_chat, exiting_chat = (
+            "Entrée en mode discussion. Dites 'sortir' pour quitter.",
+            "Sortie du mode discussion.",
+        )
+        exiting_program, unknown_command = (
+            "Fermeture du programme. Au revoir !",
+            "Commande inconnue. Dites capturer, lire, traduire, discussion, compteur, aide, à propos ou sortir.",
+        )
+        speak("Langue définie sur le français.", lang=current_tts_lang)
+
+    # — DEFAULT ENGLISH —
+    else:
+        current_input_lang, current_tts_lang = "en-US", "en"
+        error_understand = "Sorry, I didn't catch that. Please try again."
+        error_connection = "Connection issue. Please check your internet."
+        exit_cmd, capture_cmd, translate_cmd, read_cmd = "exit", "capture", "translate", "read"
+        chat_cmd, moneycounter_cmd = "chat", "money counter"
+        prompt_capture = "What do you see in this image?"
+        prompt_translate = "Translate any text in this image into English."
+        prompt_read = "Read the text in this image aloud."
+        prompt_moneycounter = "Count the money in this image."
+        chat_system_prompt = (
+            "You are a friendly and informative conversational assistant. Engage like a friend."
+        )
+        feedback_capture_start, feedback_capture_success = (
+            "Capturing image now.",
+            "Image captured successfully.",
+        )
+        error_capture = "Failed to capture image. Please check your camera."
+        entering_chat, exiting_chat = (
+            "Entering chitchat mode. Say 'exit' to leave.",
+            "Exiting chitchat mode.",
+        )
+        exiting_program, unknown_command = (
+            "Exiting program now. Goodbye!",
+            "Unknown command. Say capture, read, translate, chat, moneycounter, help, about, or exit.",
+        )
+        speak("Language not recognized. Defaulting to English.", lang=current_tts_lang)
+
+# ─────────────────────────────────────────────────────────────
+# INITIALISE LANGUAGE
+# ─────────────────────────────────────────────────────────────
+select_language()
+
+# ─────────────────────────────────────────────────────────────
+# IMAGE UTILITIES
+# ─────────────────────────────────────────────────────────────
+def image_to_base64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+def capture_image():
+    global last_image_b64
+    speak(feedback_capture_start, lang=current_tts_lang)
+    print("📷 Capturing image...")
+    cam = cv2.VideoCapture(0)
+    ret, frame = cam.read()
+    img_path = "captured.jpg"
+    if ret:
+        cv2.imwrite(img_path, frame)
+        last_image_b64 = image_to_base64(img_path)
+        print("✅ Image saved.")
+        speak(feedback_capture_success, lang=current_tts_lang)
+    else:
+        print("❌", error_capture)
+        speak(error_capture, lang=current_tts_lang)
+        img_path, last_image_b64 = None, None
+    cam.release()
+    return img_path
+
+def send_image_to_chatgpt(image_path, prompt):
+    speak("Sending image to assistant for " + prompt, lang=current_tts_lang)
+    print(f"🤖 Sending image to ChatGPT with prompt: {prompt}")
+    b64 = image_to_base64(image_path)
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-4-turbo",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                    ],
+                }
+            ],
+            max_tokens=500,
+        )
+        result = resp.choices[0].message.content
+        print("🧠 ChatGPT Response:", result)
+        return result
+    except Exception as e:
+        print("Error with OpenAI API in send_image_to_chatgpt:", e)
+        img_error = {
+            "en": "There was an error processing your image request.",
+            "ar": "حدث خطأ أثناء معالجة طلب الصورة.",
+            "fr": "Une erreur est survenue lors du traitement de votre demande d'image."
+        }
+        speak(img_error.get(current_tts_lang, "There was an error processing your image request."), lang=current_tts_lang)
+        return "There was an error processing your image request."
+
+# ─────────────────────────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────────────────────────
+while True:
+    command = autocomplete_command(listen_for_command())
+    if not command:
+        continue
+
+    # Language change
+    if any(kw in command for kw in ["change language", "غير اللغة", "changer la langue"]):
+        select_language()
+        continue
+
+    # Help / About
+    if command_matches(command, "help") or command_matches(command, "مساعدة") or command_matches(command, "aide"):
+        show_help()
+        continue
+    if command_matches(command, "about") or command_matches(command, "عن الجهاز") or command_matches(command, "à propos") or command_matches(command, "a propos"):
+        show_about()
+        continue
+
+    # Sleep mode: when the command "sleep" (or localized equivalent) is given,
+    # the program immediately enters a silent mode where it will ignore all input until a wake command is heard.
+    if command_matches(command, "sleep") or command_matches(command, "نوم") or command_matches(command, "sommeil"):
+        # Do not speak immediately; while sleeping, we call listen_for_command(suppress=True) to avoid any speech.
+        while True:
+            wake = listen_for_command(suppress=True).lower().strip()
+            if wake in ["wake", "wake up", "استيقظ", "réveille-toi"]:
+                resume_msg = {
+                    "en": "Resuming operation.",
+                    "ar": "استئناف العمل.",
+                    "fr": "Reprise de l'activité."
+                }
+                speak(resume_msg.get(current_tts_lang, "Resuming operation."), lang=current_tts_lang)
+                break
+        continue
+
+    # Exit
+    if command_matches(command, exit_cmd):
+        speak(exiting_program, lang=current_tts_lang)
+        print("👋", exiting_program)
+        break
+
+    # Capture‑based commands
+    if command_matches(command, capture_cmd):
+        path = capture_image()
+        if path:
+            speak(send_image_to_chatgpt(path, prompt_capture), lang=current_tts_lang)
+            follow_up_query()
+        continue
+    if command_matches(command, translate_cmd):
+        path = capture_image()
+        if path:
+            speak(send_image_to_chatgpt(path, prompt_translate), lang=current_tts_lang)
+            follow_up_query()
+        continue
+    if command_matches(command, read_cmd):
+        path = capture_image()
+        if path:
+            speak(send_image_to_chatgpt(path, prompt_read), lang=current_tts_lang)
+            follow_up_query()
+        continue
+    if command_matches(command, moneycounter_cmd):
+        path = capture_image()
+        if path:
+            speak(send_image_to_chatgpt(path, prompt_moneycounter), lang=current_tts_lang)
+            follow_up_query()
+        continue
+
+    # Chat mode
+    if command_matches(command, chat_cmd) or command_matches(command, "دردشة") or command_matches(command, "discussion"):
+        speak(entering_chat, lang=current_tts_lang)
+        print("💬", entering_chat)
+        while True:
+            chat_in = listen_for_chat()
+            if command_matches(chat_in, exit_cmd):
+                speak(exiting_chat, lang=current_tts_lang)
+                print("💬", exiting_chat)
+                break
+            try:
+                resp = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": chat_system_prompt},
+                        {"role": "user", "content": chat_in},
+                    ],
+                    max_tokens=300,
+                )
+                reply = resp.choices[0].message.content
+            except Exception as e:
+                print("Error with OpenAI API in chat mode:", e)
+                chat_error = {
+                    "en": "There was an error processing your chat request.",
+                    "ar": "حدث خطأ أثناء معالجة طلب الدردشة.",
+                    "fr": "Une erreur est survenue lors du traitement de votre demande de chat."
+                }
+                speak(chat_error.get(current_tts_lang, "There was an error processing your chat request."), lang=current_tts_lang)
+                continue
+            print("🧠 ChatGPT Chitchat Response:", reply)
+            speak(reply, lang=current_tts_lang)
+        continue
+
+    # Unknown command
+    print(unknown_command)
+    speak(unknown_command, lang=current_tts_lang)
